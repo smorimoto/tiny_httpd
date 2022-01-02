@@ -88,6 +88,9 @@ module Buf_ : sig
   val clear : t -> unit
   val contents : t -> string
 
+  val create : ?size:int -> unit -> t
+  (** Create a new buffer. *)
+
   val bytes_slice : t -> bytes
   (** Access underlying slice of bytes.
       @since 0.5 *)
@@ -129,10 +132,12 @@ module Byte_stream : sig
 
   val empty : t
 
-  val of_chan : buf:Buf_.t -> in_channel -> t
-  (** Make a buffered stream from the given channel. *)
+  val of_chan : ?buf:Buf_.t -> in_channel -> t
+  (** Make a buffered stream from the given channel.
+      @param buf buffer to (re)use. See {!alloc_buf_for_stream} or
+      {!Buf_.create}. *)
 
-  val of_chan_close_noerr : buf:Buf_.t -> in_channel -> t
+  val of_chan_close_noerr : ?buf:Buf_.t -> in_channel -> t
   (** Same as {!of_chan} but the [close] method will never fail. *)
 
   val of_bytes : ?i:int -> ?len:int -> bytes -> t
@@ -149,17 +154,20 @@ module Byte_stream : sig
   (** Write the stream to the channel.
       @since 0.3 *)
 
-  val with_file : buf:Buf_.t -> string -> (t -> 'a) -> 'a
+  val with_file : ?buf:Buf_.t -> string -> (t -> 'a) -> 'a
   (** Open a file with given name, and obtain an input stream
-      on its content. When the function returns, the stream (and file) are closed. *)
+      on its content. When the function returns,
+      the stream (and file) are closed.
+  *)
 
   val read_line : buf:Buf_.t -> t -> string
   (** Read a line from the stream.
       @param buf a buffer to (re)use. Its content will be cleared. *)
 
-  val read_all : buf:Buf_.t -> t -> string
+  val read_all : ?buf:Buf_.t -> t -> string
   (** Read the whole stream into a string.
-      @param buf a buffer to (re)use. Its content will be cleared. *)
+      @param buf the buffer to use. Its content will be cleared.
+      See {!with_buf} or {!Buf_.create}. *)
 end
 
 (** {2 Methods} *)
@@ -295,7 +303,7 @@ module Request : sig
       @since 0.3
   *)
 
-  val read_body_full : buf:Buf_.t -> byte_stream t -> string t
+  val read_body_full : ?buf:Buf_.t -> byte_stream t -> string t
   (** Read the whole body into a string. Potentially blocking.
 
       @param buf buffer to use to read the body. See {!with_alloc_buf}.
@@ -307,7 +315,6 @@ module Request : sig
   module Internal_ : sig
     val parse_req_start : ?buf:Buf_.t -> get_time_s:(unit -> float) -> byte_stream -> unit t option
     val parse_body : ?buf:Buf_.t -> unit t -> byte_stream -> byte_stream t
-    val read_body_full : ?buf:Buf_.t -> byte_stream t -> string t
   end
   (**/**)
 end

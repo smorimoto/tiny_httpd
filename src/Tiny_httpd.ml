@@ -94,15 +94,20 @@ end
 module Byte_stream = struct
   type t = byte_stream
 
-  let close self = self.bs_close()
+  let _nop _=()
+
+  let close self =
+    let f = self.bs_close in
+    self.bs_close <- _nop; (* idempotency *)
+    f()
 
   let empty = {
     bs_fill_buf=(fun () -> Bytes.empty, 0, 0);
-    bs_consume=(fun _ -> ());
-    bs_close=(fun () -> ());
+    bs_consume=_nop;
+    bs_close=_nop;
   }
 
-  let of_chan_ ~buf ~close ic : t =
+  let of_chan_ ?(buf=Buf_.create ~size:(16*1024) ()) ~close ic : t =
     let b = buf.Buf_.bytes in (* we just reuse the bytes *)
     let i = ref 0 in
     let len = ref 0 in
@@ -152,17 +157,19 @@ module Byte_stream = struct
   let of_string s : t =
     of_bytes (Bytes.unsafe_of_string s)
 
-  let with_file ~buf file f =
+  let with_file ?buf file f =
     let ic = open_in file in
     try
-      let x = f (of_chan ~buf ic) in
+      let stream = of_chan ?buf ic in
+      let x = f stream in
       close_in ic;
+      close stream;
       x
     with e ->
       close_in_noerr ic;
       raise e
 
-  let read_all ~buf (self:t) : string =
+  let read_all ?(buf=Buf_.create ~size:(16*1024) ()) (self:t) : string =
     let continue = ref true in
     while !continue do
       let s, i, len = self.bs_fill_buf () in
@@ -592,7 +599,11 @@ module Request = struct
     | e ->
       Error (400, Printexc.to_string e)
 
-  let read_body_full ~buf (self:byte_stream t) : string t =
+  let read_body_full ?buf (self:byte_stream t) : string t =
+    let buf = match buf with
+      | Some b -> b
+      | None -> Buf_.create ()
+    in
     try
       let body = Byte_stream.read_all ~buf self.body in
       { self with body }
@@ -606,9 +617,6 @@ module Request = struct
 
     let parse_body ?(buf=Buf_.create()) req bs : _ t =
       parse_body_ ~tr_stream:(fun s->s) ~buf {req with body=bs} |> unwrap_resp_result
-
-    let read_body_full ?(buf=Buf_.create()) req =
-      read_body_full ~buf req
   end
 end
 
@@ -623,7 +631,7 @@ end
     assert_equal (Some "coucou") (Headers.get "host" req.Request.headers);
     assert_equal (Some "11") (Headers.get "content-length" req.Request.headers);
     assert_equal "hello" req.Request.path;
-    let req = Request.Internal_.(parse_body req str |> read_body_full) in
+    let req = Request.(Internal_.parse_body req str |> read_body_full) in
     assert_equal ~printer:(fun s->s) "salutations" req.Request.body;
     ()
 *)
