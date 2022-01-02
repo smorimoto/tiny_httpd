@@ -75,17 +75,17 @@ echo:
 *)
 
 
-(** {2 Tiny buffer implementation}
+(** Buffers
 
     These buffers are used to avoid allocating too many byte arrays when
     processing streams and parsing requests.
+    They should be allocated through the main server, see {!with_buf}.
 *)
-
 module Buf_ : sig
   type t
+
   val size : t -> int
   val clear : t -> unit
-  val create : ?size:int -> unit -> t
   val contents : t -> string
 
   val bytes_slice : t -> bytes
@@ -115,7 +115,7 @@ type byte_stream = {
   bs_consume: int -> unit;
   (** Consume n bytes from the buffer. This should only be called with [n <= len]
       after a call to [is_fill_buf] that returns a slice of length [len]. *)
-  bs_close: unit -> unit;
+  mutable bs_close: unit -> unit;
   (** Close the stream. *)
 }
 (** A buffered stream, with a view into the current buffer (or refill if empty),
@@ -129,10 +129,10 @@ module Byte_stream : sig
 
   val empty : t
 
-  val of_chan : ?buf_size:int -> in_channel -> t
+  val of_chan : buf:Buf_.t -> in_channel -> t
   (** Make a buffered stream from the given channel. *)
 
-  val of_chan_close_noerr : ?buf_size:int -> in_channel -> t
+  val of_chan_close_noerr : buf:Buf_.t -> in_channel -> t
   (** Same as {!of_chan} but the [close] method will never fail. *)
 
   val of_bytes : ?i:int -> ?len:int -> bytes -> t
@@ -149,15 +149,15 @@ module Byte_stream : sig
   (** Write the stream to the channel.
       @since 0.3 *)
 
-  val with_file : ?buf_size:int -> string -> (t -> 'a) -> 'a
+  val with_file : buf:Buf_.t -> string -> (t -> 'a) -> 'a
   (** Open a file with given name, and obtain an input stream
       on its content. When the function returns, the stream (and file) are closed. *)
 
-  val read_line : ?buf:Buf_.t -> t -> string
+  val read_line : buf:Buf_.t -> t -> string
   (** Read a line from the stream.
       @param buf a buffer to (re)use. Its content will be cleared. *)
 
-  val read_all : ?buf:Buf_.t -> t -> string
+  val read_all : buf:Buf_.t -> t -> string
   (** Read the whole stream into a string.
       @param buf a buffer to (re)use. Its content will be cleared. *)
 end
@@ -295,16 +295,19 @@ module Request : sig
       @since 0.3
   *)
 
-  val read_body_full : ?buf_size:int -> byte_stream t -> string t
+  val read_body_full : buf:Buf_.t -> byte_stream t -> string t
   (** Read the whole body into a string. Potentially blocking.
 
-      @param buf_size initial size of underlying buffer (since 0.11) *)
+      @param buf buffer to use to read the body. See {!with_alloc_buf}.
+      @param buf_size initial size of underlying buffer
+      (since 0.11, remove since NEXT_RELEASE) *)
 
   (**/**)
   (* for testing purpose, do not use *)
   module Internal_ : sig
     val parse_req_start : ?buf:Buf_.t -> get_time_s:(unit -> float) -> byte_stream -> unit t option
     val parse_body : ?buf:Buf_.t -> unit t -> byte_stream -> byte_stream t
+    val read_body_full : ?buf:Buf_.t -> byte_stream t -> string t
   end
   (**/**)
 end
@@ -544,6 +547,24 @@ val create :
 
     @param get_time_s obtain the current timestamp in seconds.
       This parameter exists since 0.11.
+*)
+
+val with_alloc_buf : t -> (Buf_.t -> 'a) -> 'a
+(** [with_alloc_buf server f] calls [f buf] with a buffer [buf].
+    It behaves like [f buf].
+
+    Make sure that the [buf] argument doesn't escape the scope of the call to
+    [f], as the buffer might be recycled internally.
+    @since NEXT_RELEASE
+*)
+
+val alloc_buf_for_stream : t -> (Buf_.t -> Byte_stream.t) -> Byte_stream.t
+(** Similar to {!with_alloc_buf}, except the buffer can live as long as the returned
+    byte stream.
+    This is handy along with {!Response.make_stream}, to request a buffer to
+    process the stream, and ensure the buffer will be recycled when
+    the stream is closed.
+    @since NEXT_RELEASE
 *)
 
 val addr : t -> string

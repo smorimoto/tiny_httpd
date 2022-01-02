@@ -204,9 +204,10 @@ let add_dir_path ~config ~dir ~prefix server =
                         with _ -> [])
                  with _ -> []
              in
+             S.with_alloc_buf server @@ fun buf ->
              S.Response.make_raw_stream
                ~headers:(mime_type@["Etag", Lazy.force mtime])
-               ~code:200 (S.Byte_stream.of_chan ic)
+               ~code:200 (S.Byte_stream.of_chan ~buf ic)
            with e ->
              S.Response.fail ~code:500 "error while reading file: %s" (Printexc.to_string e))
       )

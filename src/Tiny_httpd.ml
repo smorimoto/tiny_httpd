@@ -1,7 +1,7 @@
 type byte_stream = {
   bs_fill_buf: unit -> (bytes * int * int);
   bs_consume: int -> unit;
-  bs_close: unit -> unit;
+  mutable bs_close: unit -> unit;
 }
 (** A buffer input stream, with a view into the current buffer (or refill if empty),
     and a function to consume [n] bytes *)
@@ -29,13 +29,10 @@ module Buf_ = struct
 
   let size self = self.i
   let bytes_slice self = self.bytes
-  let clear self : unit =
-    if Bytes.length self.bytes > 4_096 * 1_024 then (
-      self.bytes <- Bytes.make 4096 ' '; (* free big buffer *)
-    );
-    self.i <- 0
+  let[@inline] clear self : unit = self.i <- 0
 
   let resize self new_size : unit =
+    if new_size > Sys.max_string_length then failwith "Buf_.resize: too big";
     let new_buf = Bytes.make new_size ' ' in
     Bytes.blit self.bytes 0 new_buf 0 self.i;
     self.bytes <- new_buf
@@ -55,6 +52,45 @@ module Buf_ = struct
     x
 end
 
+(** A pool of buffers, to reuse memory *)
+module Buf_pool_ : sig
+  type t
+  val create : ?buf_size:int -> unit -> t
+  val alloc : t -> Buf_.t
+  val dealloc : t -> Buf_.t -> unit
+end = struct
+  type t = {
+    buf_size: int;
+    mutable n: int;
+    mutable bufs: Buf_.t list;
+  }
+
+  let create ?(buf_size=16 * 1024) () : t =
+    {
+      buf_size;
+      n=0; bufs=[];
+    }
+
+  let alloc self =
+    match self.bufs with
+    | [] -> Buf_.create ~size:self.buf_size ()
+    | b :: tl ->
+      self.bufs <- tl;
+      self.n <- self.n - 1;
+      b
+
+  let max_bufs_ = 512 (* do not recycle buffers if we already have that many *)
+
+  let dealloc self b =
+    if self.n < max_bufs_ &&
+       Bytes.length b.Buf_.bytes >= self.buf_size
+    then (
+      Buf_.clear b;
+      self.n <- self.n + 1;
+      self.bufs <- b :: self.bufs
+    )
+end
+
 module Byte_stream = struct
   type t = byte_stream
 
@@ -66,16 +102,16 @@ module Byte_stream = struct
     bs_close=(fun () -> ());
   }
 
-  let of_chan_ ?(buf_size=16 * 1024) ~close ic : t =
+  let of_chan_ ~buf ~close ic : t =
+    let b = buf.Buf_.bytes in (* we just reuse the bytes *)
     let i = ref 0 in
     let len = ref 0 in
-    let buf = Bytes.make buf_size ' ' in
     { bs_fill_buf=(fun () ->
       if !i >= !len then (
         i := 0;
-        len := input ic buf 0 (Bytes.length buf);
+        len := input ic b 0 (Bytes.length b);
       );
-      buf, !i,!len - !i);
+      b, !i,!len - !i);
       bs_consume=(fun n -> i := !i + n);
       bs_close=(fun () -> close ic)
     }
@@ -116,17 +152,17 @@ module Byte_stream = struct
   let of_string s : t =
     of_bytes (Bytes.unsafe_of_string s)
 
-  let with_file ?buf_size file f =
+  let with_file ~buf file f =
     let ic = open_in file in
     try
-      let x = f (of_chan ?buf_size ic) in
+      let x = f (of_chan ~buf ic) in
       close_in ic;
       x
     with e ->
       close_in_noerr ic;
       raise e
 
-  let read_all ?(buf=Buf_.create()) (self:t) : string =
+  let read_all ~buf (self:t) : string =
     let continue = ref true in
     while !continue do
       let s, i, len = self.bs_fill_buf () in
@@ -230,7 +266,7 @@ module Byte_stream = struct
       }
     )
 
-  let read_line ?(buf=Buf_.create()) self : string =
+  let read_line ~buf self : string =
     read_line_into self ~buf;
     Buf_.contents buf
 end
@@ -556,9 +592,8 @@ module Request = struct
     | e ->
       Error (400, Printexc.to_string e)
 
-  let read_body_full ?buf_size (self:byte_stream t) : string t =
+  let read_body_full ~buf (self:byte_stream t) : string t =
     try
-      let buf = Buf_.create ?size:buf_size () in
       let body = Byte_stream.read_all ~buf self.body in
       { self with body }
     with
@@ -571,6 +606,9 @@ module Request = struct
 
     let parse_body ?(buf=Buf_.create()) req bs : _ t =
       parse_body_ ~tr_stream:(fun s->s) ~buf {req with body=bs} |> unwrap_resp_result
+
+    let read_body_full ?(buf=Buf_.create()) req =
+      read_body_full ~buf req
   end
 end
 
@@ -585,7 +623,7 @@ end
     assert_equal (Some "coucou") (Headers.get "host" req.Request.headers);
     assert_equal (Some "11") (Headers.get "content-length" req.Request.headers);
     assert_equal "hello" req.Request.path;
-    let req = Request.Internal_.parse_body req str |> Request.read_body_full in
+    let req = Request.Internal_.(parse_body req str |> read_body_full) in
     assert_equal ~printer:(fun s->s) "salutations" req.Request.body;
     ()
 *)
@@ -691,6 +729,13 @@ module Response = struct
       | `Stream str -> output_stream_chunked_ oc str;
     end;
     flush oc
+
+  (** Dispose of the stream. *)
+  let close_ (self:t) =
+    match self.body with
+    | `Stream bs -> bs.bs_close()
+    | `String _ | `Void -> ()
+
 end
 
 (* semaphore, for limiting concurrency. *)
@@ -862,6 +907,7 @@ type t = {
   masksigpipe: bool;
 
   buf_size: int;
+  buf_pool : Buf_pool_.t;
 
   get_time_s : unit -> float;
 
@@ -886,6 +932,23 @@ let addr self = self.addr
 let port self = self.port
 
 let active_connections self = Sem_.num_acquired self.sem_max_connections - 1
+
+let with_alloc_buf self f =
+  let buf = Buf_pool_.alloc self.buf_pool in
+  try
+    let res = f buf in
+    Buf_pool_.dealloc self.buf_pool buf;
+    res
+  with e ->
+    Buf_pool_.dealloc self.buf_pool buf;
+    raise e
+
+let alloc_buf_for_stream self f =
+  let buf = Buf_pool_.alloc self.buf_pool in
+  let stream = f buf in
+  let close = stream.bs_close in
+  stream.bs_close <- (fun () -> Buf_pool_.dealloc self.buf_pool buf; close());
+  stream
 
 let add_middleware ~stage self m =
   let stage = match stage with
@@ -952,7 +1015,13 @@ let add_route_handler_
 
 let add_route_handler (type a) ?accept ?middlewares ?meth
     self (route:(a,_) Route.t) (f:_) : unit =
-  let tr_req _oc req ~resp f = resp (f (Request.read_body_full ~buf_size:self.buf_size req)) in
+  let tr_req _oc req ~resp f =
+    let body =
+      with_alloc_buf self @@ fun buf ->
+      Request.read_body_full ~buf req
+    in
+    resp (f body)
+  in
   add_route_handler_ ?accept ?middlewares ?meth self route ~tr_req f
 
 let add_route_handler_stream ?accept ?middlewares ?meth self route f =
@@ -965,7 +1034,10 @@ let[@inline] _opt_iter ~f o = match o with
 
 let add_route_server_sent_handler ?accept self route f =
   let tr_req oc req ~resp f =
-    let req = Request.read_body_full ~buf_size:self.buf_size req in
+    let req =
+      with_alloc_buf self @@ fun buf ->
+      Request.read_body_full ~buf req
+    in
     let headers = ref Headers.(empty |> set "content-type" "text/event-stream") in
 
     (* send response once *)
@@ -1015,8 +1087,10 @@ let create
     () : t =
   let handler _req = Response.fail ~code:404 "no top handler" in
   let max_connections = max 4 max_connections in
+  let buf_pool = Buf_pool_.create ~buf_size () in
   let self = {
-    new_thread; addr; port; sock; masksigpipe; handler; buf_size;
+    new_thread; addr; port; sock; masksigpipe; handler;
+    buf_size; buf_pool;
     running= true; sem_max_connections=Sem_.create max_connections;
     path_handlers=[]; timeout; get_time_s;
     middlewares=[]; middlewares_sorted=lazy [];
@@ -1040,12 +1114,16 @@ let handle_client_ (self:t) (client_sock:Unix.file_descr) : unit =
   Unix.(setsockopt_float client_sock SO_SNDTIMEO self.timeout);
   let ic = Unix.in_channel_of_descr client_sock in
   let oc = Unix.out_channel_of_descr client_sock in
-  let buf = Buf_.create ~size:self.buf_size () in
-  let is = Byte_stream.of_chan ~buf_size:self.buf_size ic in
+  let buf_q = Buf_pool_.alloc self.buf_pool in
+  let buf_is = Buf_pool_.alloc self.buf_pool in
+  let buf_body = Buf_pool_.alloc self.buf_pool in
+  let is = Byte_stream.of_chan ~buf:buf_is ic in
+
   let continue = ref true in
   while !continue && self.running do
     _debug (fun k->k "read next request");
-    match Request.parse_req_start ~get_time_s:self.get_time_s ~buf is with
+    Buf_.clear buf_q;
+    match Request.parse_req_start ~get_time_s:self.get_time_s ~buf:buf_q is with
     | Ok None ->
       continue := false (* client is done *)
 
@@ -1070,7 +1148,9 @@ let handle_client_ (self:t) (client_sock:Unix.file_descr) : unit =
           | Some f -> unwrap_resp_result f
           | None ->
             (fun _oc req ~resp ->
-               let body_str = Request.read_body_full ~buf_size:self.buf_size req in
+               let buf = Buf_pool_.alloc self.buf_pool in
+               let body_str = Request.read_body_full ~buf req in
+               Buf_pool_.dealloc self.buf_pool buf;
                resp (self.handler body_str))
         in
 
@@ -1091,8 +1171,9 @@ let handle_client_ (self:t) (client_sock:Unix.file_descr) : unit =
         in
 
         (* now actually read request's body into a stream *)
+        Buf_.clear buf_body;
         let req =
-          Request.parse_body_ ~tr_stream:(fun s->s) ~buf {req with body=is}
+          Request.parse_body_ ~tr_stream:(fun s->s) ~buf:buf_body {req with body=is}
           |> unwrap_resp_result
         in
 
@@ -1101,7 +1182,8 @@ let handle_client_ (self:t) (client_sock:Unix.file_descr) : unit =
           try
             if Headers.get "connection" r.Response.headers = Some"close" then
               continue := false;
-            Response.output_ oc r
+            Response.output_ oc r;
+            Response.close_ r;
           with Sys_error _ -> continue := false
         in
 
@@ -1120,6 +1202,11 @@ let handle_client_ (self:t) (client_sock:Unix.file_descr) : unit =
         continue := false;
         Response.output_ oc @@ Response.fail ~code:500 "server error: %s" (Printexc.to_string e)
   done;
+
+  Buf_pool_.dealloc self.buf_pool buf_q;
+  Buf_pool_.dealloc self.buf_pool buf_is;
+  Buf_pool_.dealloc self.buf_pool buf_body;
+
   _debug (fun k->k "done with client, exiting");
   (try Unix.close client_sock
    with e -> _debug (fun k->k "error when closing sock: %s" (Printexc.to_string e)));
