@@ -33,6 +33,13 @@ let middleware_stat () : S.Middleware.t * (unit -> string) =
   in
   m, get_stat
 
+(* ugly AF *)
+let base64 x =
+  let ic, oc = Unix.open_process "base64" in
+  output_string oc x; flush oc; close_out oc;
+  let r = input_line ic in
+  ignore (Unix.close_process (ic,oc));
+  r
 
 let () =
   let port_ = ref 8080 in
@@ -115,6 +122,29 @@ let () =
           S.Response.fail ~code:500 "couldn't upload file: %s" (Printexc.to_string e)
       );
 
+  (* protected by login *)
+  S.add_route_handler server S.Route.(exact "protected" @/ return)
+    (fun req ->
+       let ok =
+         match S.Request.get_header req "authorization" with
+         | Some v ->
+           S._debug(fun k->k"authenticate with %S" v);
+           v = "Basic " ^ base64 "user:foobar"
+         | None -> false
+       in
+       if ok then (
+         (* FIXME: a logout link *)
+         let s = "<p>hello, this is super secret!</p><a href=\"/logout\">log out</a>" in
+         S.Response.make_string (Ok s)
+       ) else (
+         let headers = S.Headers.(empty |> set "www-authenticate" "basic realm=\"echo\"") in
+         S.Response.fail ~code:401 ~headers "invalid"
+       ));
+
+  (* logout *)
+  S.add_route_handler server S.Route.(exact "logout" @/ return)
+    (fun _req -> S.Response.fail ~code:401 "logged out");
+
   (* stats *)
   S.add_route_handler server S.Route.(exact "stats" @/ return)
     (fun _req ->
@@ -137,6 +167,8 @@ let () =
                 <li><pre>/zcat/'path' (GET) to download a file (compressed)</pre></li>\n\
                 <li><pre>/stats/ (GET) to access statistics</pre></li>\n\
                 <li><pre>/quit/ (POST) to quit</pre></li>\n\
+                <li><pre>/protected/ (GET) to see a login-protected page (user:foobar)</pre></li>\n\
+                <li><pre>/logout/ (POST) to logout</pre></li>\n\
                 </ul></body>"
        in
        S.Response.make_string ~headers:["content-type", "text/html"] @@ Ok s);
