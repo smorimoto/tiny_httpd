@@ -120,6 +120,10 @@ let () =
        S.Response.make_string @@ Ok stats
     );
 
+  (* quit *)
+  S.add_route_handler server ~meth:`POST S.Route.(exact "quit" @/ return)
+    (fun _ -> S.stop server; S.Response.make_string @@ Ok "stopping…");
+
   (* main page *)
   S.add_route_handler server S.Route.(return)
     (fun _req ->
@@ -130,6 +134,7 @@ let () =
                 <li><pre>/upload/'path' (PUT) to upload a file</pre></li>\n\
                 <li><pre>/zcat/'path' (GET) to download a file (compressed)</pre></li>\n\
                 <li><pre>/stats/ (GET) to access statistics</pre></li>\n\
+                <li><pre>/quit/ (POST) to quit</pre></li>\n\
                 </ul></body>"
        in
        S.Response.make_string ~headers:["content-type", "text/html"] @@ Ok s);
